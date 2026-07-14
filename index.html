@@ -75,9 +75,10 @@
         let currentEmpId = null;
         let currentEmpName = null;
         let STORE_IP = null; 
-        let MY_CURRENT_IP = null; // Cache IP thiết bị để lúc chấm công không phải chờ
-        let isScanning = false;   // Cờ khóa luồng ma
-        let isAiReady = false;    // Cờ báo AI đã warm-up xong
+        let MY_CURRENT_IP = null; 
+        let isScanning = false;   
+        let isAiReady = false;    
+        let aiProcessingLock = false; // Ngăn không cho gọi API liên tục
         
         const video = document.getElementById('video');
         const overlay = document.getElementById('status-overlay');
@@ -93,13 +94,10 @@
 
         async function initSystem() {
             try {
-                loadingText.innerText = "Đang lấy dữ liệu từ Sheets...";
+                loadingText.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Đang đồng bộ dữ liệu...`;
                 
-                // TẢI IP CHẠY NGẦM (Giúp bấm chấm công mượt ngay lập tức)
-                fetch('https://api.ipify.org?format=json')
-                    .then(res => res.json())
-                    .then(d => { MY_CURRENT_IP = d.ip; })
-                    .catch(() => {});
+                // TẢI IP CHẠY NGẦM 
+                fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => { MY_CURRENT_IP = d.ip; }).catch(() => {});
 
                 // Lấy IP Cửa hàng
                 try {
@@ -121,13 +119,13 @@
                     return;
                 }
 
-                loadingText.innerText = "Đang khởi động AI...";
+                loadingText.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Đang nạp lõi AI...`;
                 const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
-                await Promise.all([
-                    faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-                    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-                    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
-                ]);
+                
+                // Ép trình duyệt dùng WebGL rõ ràng để tránh nó tự fallback làm đơ máy
+                await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+                await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
 
                 const labeledDescriptors = validEmployees.map(emp => {
                     const floatArray = new Float32Array(Object.values(emp.descriptor));
@@ -144,7 +142,6 @@
         }
 
         function startCamera() {
-            // Xin quyền GPS nhẹ nhàng (Để trình duyệt lưu cho lần sau)
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(() => {}, () => {}); 
             }
@@ -155,21 +152,24 @@
             .then(stream => {
                 video.srcObject = stream;
                 
-                // WARM-UP AI NGAY LÚC KHỞI ĐỘNG (Chống treo web)
-                video.onloadedmetadata = async () => {
-                    loadingText.innerText = "Đang khởi động WebGL (Vui lòng đợi)...";
-                    try {
-                        // Ép AI quét thử 1 phát đồ họa để máy khởi động mượt
-                        await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }));
-                    } catch(e) {}
+                // KHI VIDEO BẮT ĐẦU CHẠY
+                video.onplay = () => {
+                    if (isAiReady) return; // Nếu đã load rồi thì bỏ qua
 
-                    overlay.style.display = 'none';
-                    isAiReady = true;
+                    loadingText.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Tối ưu hóa đồ họa (Vui lòng đợi 2s)...`;
+                    
+                    // THỦ THUẬT: Cho trình duyệt thở 1 giây để nó vẽ xong video lên màn hình, 
+                    // SAU ĐÓ mới ép GPU tính toán AI. (Đây là mấu chốt giúp Vercel/Mobile không treo)
+                    setTimeout(async () => {
+                        try {
+                            // Warm-up với cấu hình chính xác sẽ dùng ở hàm quét
+                            await faceapi.detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }));
+                        } catch(e) { console.error("Lỗi Warm-up", e); }
 
-                    // Ngăn chặn gọi hàm 2 lần tạo ra vòng lặp ma
-                    video.removeEventListener('play', triggerScan);
-                    video.addEventListener('play', triggerScan);
-                    triggerScan(); // Chạy ngay lập tức
+                        overlay.style.display = 'none'; // Tắt màn chờ
+                        isAiReady = true;               // Báo cờ sẵn sàng
+                        triggerScan();                  // Bắt đầu vòng lặp
+                    }, 1000); // <-- Khóa đệm 1000ms thần thánh
                 };
             })
             .catch(err => {
@@ -185,17 +185,16 @@
             }
         }
 
-        // ========================================================
-        // HÀM QUÉT KHUÔN MẶT CÓ BỘ ĐỆM (CHỐNG TRÀN RAM, TREO WEB)
-        // ========================================================
         async function scanFaceContinously() {
+            // Thoát hoàn toàn nếu video dừng
             if (video.paused || video.ended || !isScanning) {
                 isScanning = false;
                 return;
             }
 
             try {
-                if (isAiReady && faceMatcher !== null) {
+                // Chỉ nhận diện khi hệ thống rảnh (aiProcessingLock = false)
+                if (isAiReady && faceMatcher !== null && !aiProcessingLock) {
                     const detection = await faceapi.detectSingleFace(
                         video, 
                         new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 })
@@ -230,8 +229,8 @@
                 console.error("Lỗi AI quét:", error);
             }
 
-            // NGHỈ 800MS TRƯỚC KHI QUÉT TIẾP (Máy chạy êm ru cả ngày)
-            setTimeout(scanFaceContinously, 800); 
+            // Gọi đệ quy quét tiếp sau 1000ms. Dùng setTimeout giúp trình duyệt dọn rác bộ nhớ kịp thời.
+            setTimeout(scanFaceContinously, 1000); 
         }
 
         function resetDetection() {
@@ -245,15 +244,17 @@
         async function submitCheckIn(type) {
             if (!currentEmpId) return;
 
+            // Khóa AI lại không cho quét nữa trong lúc đang tải gửi API
+            aiProcessingLock = true; 
             Swal.fire({ title: 'Đang kiểm tra bảo mật...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
 
-            // KIỂM TRA MẠNG WI-FI (Sử dụng IP đã nạp ngầm, tốc độ 0 giây)
+            // KIỂM TRA MẠNG WI-FI
             if (STORE_IP && MY_CURRENT_IP && MY_CURRENT_IP === STORE_IP) {
                 sendToServer(type, "Mạng Wi-Fi Quán");
                 return; 
             }
 
-            // KIỂM TRA GPS NẾU KHÔNG DÙNG WIFI HOẶC CHƯA CÓ IP
+            // KIỂM TRA GPS NẾU KHÔNG DÙNG WIFI
             Swal.update({ title: 'Đang xác thực tọa độ GPS...' });
             
             if (navigator.geolocation) {
@@ -265,7 +266,7 @@
                                 icon: 'warning', 
                                 title: 'Tín hiệu GPS quá yếu!', 
                                 text: `Sai số hiện tại là ${Math.round(accuracy)}m. Vui lòng kết nối vào Wi-Fi của quán để được chấm công ngay lập tức!` 
-                            });
+                            }).then(() => { aiProcessingLock = false; }); // Mở khóa AI
                             return; 
                         }
 
@@ -275,16 +276,18 @@
                                 icon: 'error', 
                                 title: 'Ngoài phạm vi', 
                                 html: `Bạn cách quán <b>${Math.round(distance)}m</b>.<br>Vui lòng kết nối <b>Wi-Fi quán</b> hoặc di chuyển vào khu vực ${ALLOWED_RADIUS}m.` 
-                            });
+                            }).then(() => { aiProcessingLock = false; });
                         } else {
                             sendToServer(type, `${position.coords.latitude}, ${position.coords.longitude}`);
                         }
                     },
-                    () => Swal.fire({ icon: 'error', title: 'Lỗi GPS', text: 'Hãy cấp quyền định vị hoặc kết nối vào mạng Wi-Fi của quán!' }),
+                    () => {
+                        Swal.fire({ icon: 'error', title: 'Lỗi GPS', text: 'Hãy cấp quyền định vị hoặc kết nối vào mạng Wi-Fi của quán!' }).then(() => { aiProcessingLock = false; });
+                    },
                     { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 } 
                 );
             } else {
-                Swal.fire({ icon: 'error', title: 'Thiết bị không hỗ trợ', text: 'Vui lòng dùng thiết bị có hỗ trợ định vị.' });
+                Swal.fire({ icon: 'error', title: 'Thiết bị không hỗ trợ', text: 'Vui lòng dùng thiết bị có hỗ trợ định vị.' }).then(() => { aiProcessingLock = false; });
             }
         }
 
@@ -331,13 +334,13 @@
             .then(res => res.json())
             .then(data => {
                 if(data.status === 'success') {
-                    Swal.fire({ icon: 'success', title: 'Thành công!', text: data.message, timer: 4000 });
+                    Swal.fire({ icon: 'success', title: 'Thành công!', text: data.message, timer: 4000 }).then(() => { aiProcessingLock = false; });
                 } else {
-                    Swal.fire({ icon: 'warning', title: 'Lưu ý', text: data.message });
+                    Swal.fire({ icon: 'warning', title: 'Lưu ý', text: data.message }).then(() => { aiProcessingLock = false; });
                 }
             })
             .catch((err) => {
-                Swal.fire({ icon: 'error', title: 'Lỗi mạng', text: 'Không thể kết nối đến máy chủ Google.' });
+                Swal.fire({ icon: 'error', title: 'Lỗi mạng', text: 'Không thể kết nối đến máy chủ Google.' }).then(() => { aiProcessingLock = false; });
             });
         }
 
