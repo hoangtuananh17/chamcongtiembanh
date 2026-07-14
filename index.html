@@ -93,53 +93,49 @@
         }, 1000);
 
         async function initSystem() {
-            try {
-                loadingText.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Đang đồng bộ dữ liệu...`;
-                
-                // TẢI IP CHẠY NGẦM 
-                fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => { MY_CURRENT_IP = d.ip; }).catch(() => {});
+    try {
+        loadingText.innerText = "Đang lấy dữ liệu từ Sheets...";
+        
+        // 1. Tải dữ liệu nhân viên
+        const response = await fetch(APPS_SCRIPT_URL + '?action=get_employees');
+        const employees = await response.json();
 
-                // Lấy IP Cửa hàng
-                try {
-                    const resIP = await fetch(APPS_SCRIPT_URL + '?action=get_store_ip');
-                    STORE_IP = (await resIP.json()).ip;
-                } catch(e) { }
+        // 2. BỘ LỌC BẢO VỆ: Chỉ lấy những người đã có face descriptor
+        const validEmployees = employees.filter(emp => emp.hasFace === true && emp.descriptor !== null);
 
-                const response = await fetch(APPS_SCRIPT_URL + '?action=get_employees');
-                const employees = await response.json();
-
-                if(employees.length === 0) {
-                    loadingText.innerText = "Chưa có nhân viên nào được đăng ký!";
-                    return;
-                }
-
-                const validEmployees = employees.filter(emp => emp.descriptor && emp.descriptor !== null);
-                if(validEmployees.length === 0) {
-                    loadingText.innerText = "Chưa có mẫu khuôn mặt nào!";
-                    return;
-                }
-
-                loadingText.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Đang nạp lõi AI...`;
-                const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
-                
-                // Ép trình duyệt dùng WebGL rõ ràng để tránh nó tự fallback làm đơ máy
-                await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-                await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
-                await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
-
-                const labeledDescriptors = validEmployees.map(emp => {
-                    const floatArray = new Float32Array(Object.values(emp.descriptor));
-                    return new faceapi.LabeledFaceDescriptors(`${emp.maNV}|${emp.hoTen}`, [floatArray]);
-                });
-                
-                faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.45);
-                startCamera();
-
-            } catch (error) {
-                loadingText.innerHTML = `<span class="text-red-400">Lỗi kết nối máy chủ!</span>`;
-                console.error(error);
-            }
+        if(validEmployees.length === 0) {
+            loadingText.innerText = "Chưa có nhân viên nào có dữ liệu khuôn mặt!";
+            return;
         }
+
+        loadingText.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Đang nạp lõi AI...`;
+        const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+        
+        await Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+            faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+            faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)
+        ]);
+
+        // 3. Tạo FaceMatcher an toàn
+        const labeledDescriptors = validEmployees.map(emp => {
+            // Đảm bảo dữ liệu là mảng Float32
+            const floatArray = new Float32Array(Object.values(emp.descriptor));
+            return new faceapi.LabeledFaceDescriptors(`${emp.maNV}|${emp.hoTen}`, [floatArray]);
+        });
+        
+        faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.45);
+        
+        // Gán vào biến toàn cục để dùng ở hàm khác
+        window.employees = employees; 
+        
+        startCamera();
+
+    } catch (error) {
+        loadingText.innerHTML = `<span class="text-red-400">Lỗi: ${error.message}</span>`;
+        console.error("Lỗi khởi tạo:", error);
+    }
+}
 
         function startCamera() {
             if (navigator.geolocation) {
